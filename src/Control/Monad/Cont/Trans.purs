@@ -13,6 +13,8 @@ import Control.Monad.Eff.Class (MonadEff, liftEff)
 import Control.Monad.Cont.Class
 import Control.Monad.Reader.Class (MonadReader, ask, local)
 import Control.Monad.State.Class (MonadState, state)
+import Control.Monad.Rec.Class (MonadRec, tailRecM)
+import Data.Either (Either(Left, Right), either)
 
 -- | The CPS monad transformer.
 -- |
@@ -62,3 +64,54 @@ instance monadReaderContT :: (MonadReader r1 m) => MonadReader r1 (ContT r m) wh
 
 instance monadStateContT :: (MonadState s m) => MonadState s (ContT r m) where
   state = lift <<< state
+
+data SuspF a next
+  = Suspend (Unit -> next)
+  | Done a
+
+newtype SuspT m a = SuspT (m (SuspF a (SuspT m a)))
+
+unSuspT :: forall m a. SuspT m a -> m (SuspF a (SuspT m a))
+unSuspT (SuspT a) = a
+
+suspSuspend :: forall m a. (Applicative m) => (Unit -> SuspT m a) -> SuspT m a
+suspSuspend thunk = SuspT $ return $ Suspend thunk
+
+newtype SuspContT r m a = SuspContT ((a -> SuspT m r) -> SuspT m r)
+
+unSuspContT :: forall r m a. SuspContT r m a -> ((a -> SuspT m r) -> SuspT m r)
+unSuspContT (SuspContT a) = a
+
+runSuspContT :: forall r m a. (MonadRec m) => SuspContT r m a -> (a -> m r) -> m r
+runSuspContT (SuspContT c) f = runSuspT $ c (\a -> SuspT $ Done <$> f a)
+
+runSuspT :: forall m r. (MonadRec m) => SuspT m r -> m r
+runSuspT (SuspT s) = s >>= (tailRecM go)
+  where
+    go :: SuspF r (SuspT m r) -> m (Either (SuspF r (SuspT m r)) r)
+    go (Suspend thunk) = Left <$> (unSuspT $ thunk unit)
+    go (Done r) = return $ Right r
+
+toSuspContT :: forall r m a. (MonadRec m) => ContT r m a -> SuspContT r m a
+toSuspContT (ContT c) = SuspContT (\k -> SuspT $ Done <$> c (\a -> runSuspT $ k a))
+
+fromSuspContT :: forall r m a. (MonadRec m) => SuspContT r m a -> ContT r m a
+fromSuspContT (SuspContT c) = ContT (\k -> runSuspT $ c (\a -> SuspT $ Done <$> k a))
+
+suspContTPure :: forall r m a. a -> SuspContT r m a
+suspContTPure a = SuspContT (\k -> k a)
+
+suspContTBind :: forall r m a b. (Applicative m) => SuspContT r m a -> (a -> SuspContT r m b) -> SuspContT r m b
+suspContTBind (SuspContT ca) f = SuspContT (\k -> suspSuspend (\_ -> ca (\a -> (unSuspContT $ f a) k)))
+
+tailRecSuspContT :: forall r m a b. (MonadRec m) => (a -> SuspContT r m (Either a b)) -> a -> SuspContT r m b
+tailRecSuspContT go a =
+  let go2 = tailRecSuspContT go
+  in
+  (go a) `suspContTBind` (either go2 suspContTPure)
+
+instance monadRecContT :: (MonadRec m) => MonadRec (ContT r m) where
+  tailRecM go a =
+    let go2 = (toSuspContT <<< go)
+    in
+    fromSuspContT (tailRecSuspContT go2 a)
